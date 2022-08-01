@@ -21,6 +21,9 @@ config ESP32_S3_KORVO_2_V3_0_BOARD
 config ESP32_S3_EYE_BOARD
     bool "ESP32-S3-EYE"
     depends on IDF_TARGET_ESP32S3
+config ESP32_S3_AFE_RASPBERRY_BOARD
+    bool "ESP32-S3-AFE-RASPBERRY"
+    depends on IDF_TARGET_ESP32S3
 endchoice
 
 endmenu
