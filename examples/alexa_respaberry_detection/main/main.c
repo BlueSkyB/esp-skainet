@@ -7,6 +7,7 @@
 */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wn_iface.h"
@@ -17,6 +18,15 @@
 #include "esp_board_init.h"
 #include "driver/i2s.h"
 #include "model_path.h"
+#include "ringbuf.h"
+
+#define DEBUG_SAVE_PCM      1
+
+#if DEBUG_SAVE_PCM
+#define FILES_MAX           3
+ringbuf_handle_t rb_debug[FILES_MAX] = {NULL};
+FILE * file_save[FILES_MAX] = {NULL};
+#endif
 
 int detect_flag = 0;
 static esp_afe_sr_iface_t *afe_handle = NULL;
@@ -30,8 +40,6 @@ void feed_Task(void *arg)
     int16_t *i2s_buff = malloc(audio_chunksize * sizeof(int16_t) * feed_channel);
     assert(i2s_buff);
     size_t bytes_read;
-    FILE *fp = fopen("/sdcard/out", "w");
-    if (fp == NULL) printf("can not open file\n");
 
     while (1) {
         // esp_get_feed_data(i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
@@ -47,7 +55,14 @@ void feed_Task(void *arg)
         }
 
         afe_handle->feed(afe_data, i2s_buff);
-        FatfsComboWrite(i2s_buff, audio_chunksize * nch * sizeof(int16_t), 1, fp);
+
+    #if DEBUG_SAVE_PCM
+        if (rb_bytes_available(rb_debug[0]) < audio_chunksize * nch * sizeof(int16_t)) {
+            printf("ERROR! rb_debug[0] slow!!!\n");
+        }
+
+        rb_write(rb_debug[0], i2s_buff, audio_chunksize * nch * sizeof(int16_t), 0);
+    #endif
     }
     afe_handle->destroy(afe_data);
     vTaskDelete(NULL);
@@ -69,6 +84,14 @@ void detect_Task(void *arg)
             break;
         }
 
+    #if DEBUG_SAVE_PCM
+        if (rb_bytes_available(rb_debug[1]) < afe_chunksize * 1 * sizeof(int16_t)) {
+            printf("ERROR! rb_debug[1] slow!!!\n");
+        }
+
+        rb_write(rb_debug[1], res->data, afe_chunksize * 1 * sizeof(int16_t), 0);
+    #endif
+
         if (res->wakeup_state == WAKENET_DETECTED) {
             printf("wakeword detected\n");
             printf("-----------LISTENING-----------\n");
@@ -82,10 +105,40 @@ void detect_Task(void *arg)
     vTaskDelete(NULL);
 }
 
+#if DEBUG_SAVE_PCM
+void debug_pcm_save_Task(void *arg)
+{
+    int size = 4096;   // 4k bytes
+    int16_t *buf_temp = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    while (1) {
+        for (int i = 0; i < FILES_MAX; i++) {
+            if (file_save[i] != NULL) {
+                if (rb_bytes_filled(rb_debug[i]) > size) {
+                    int ret = rb_read(rb_debug[i], buf_temp, size, 3000 / portTICK_PERIOD_MS);
+                    if ((ret < 0) || (ret < size)) {
+                        // ESP_LOGE(TAG, "rb_debug read error, ret: %d\n", ret);
+                        vTaskDelay(10 / portTICK_RATE_MS);
+                        continue;
+                    }
+                    FatfsComboWrite(buf_temp, size, 1, file_save[i]);
+                }
+            }
+        }
+        vTaskDelay(1 / portTICK_RATE_MS);
+    }
+
+    free(buf_temp);
+    vTaskDelete(NULL);
+}
+#endif
+
 void app_main()
 {
     ESP_ERROR_CHECK(esp_board_init(AUDIO_HAL_08K_SAMPLES, 1, 16));
+#if DEBUG_SAVE_PCM
     ESP_ERROR_CHECK(esp_sdcard_init("/sdcard", 10));
+#endif
 
     srmodel_list_t *models = esp_srmodel_init("model");
     if (models!=NULL) {
@@ -105,6 +158,19 @@ void app_main()
     afe_config.agc_mode = AFE_MN_PEAK_NO_AGC;
 
     esp_afe_sr_data_t *afe_data = afe_handle->create_from_config(&afe_config);
+
+#if DEBUG_SAVE_PCM
+    rb_debug[0] = rb_create(afe_handle->get_total_channel_num(afe_data) * 4 * 16000 * 2, 1);   // 4s ringbuf
+    file_save[0] = fopen("/sdcard/feed.pcm", "w");
+    if (file_save[0] == NULL) printf("can not open file\n");
+
+    rb_debug[1] = rb_create(1 * 4 * 16000 * 2, 1);   // 4s ringbuf
+    file_save[1] = fopen("/sdcard/fetch.pcm", "w");
+    if (file_save[1] == NULL) printf("can not open file\n");
+
+    xTaskCreatePinnedToCore(&debug_pcm_save_Task, "debug_pcm_save", 2 * 1024, NULL, 5, NULL, 1);
+#endif
+
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
     xTaskCreatePinnedToCore(&detect_Task, "detect", 4 * 1024, (void*)afe_data, 5, NULL, 1);
 }
