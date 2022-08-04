@@ -182,11 +182,11 @@ esp_err_t bsp_codec_adc_init(audio_hal_iface_samples_t sample_rate)
     };
 
     ret_val |= es7210_adc_init(&cfg);
-    ret_val |= es7210_adc_config_i2s(cfg.codec_mode, &cfg.i2s_iface);
     ret_val |= es7210_adc_set_gain(ES7210_INPUT_MIC1, GAIN_24DB);
     ret_val |= es7210_adc_set_gain(ES7210_INPUT_MIC2, GAIN_24DB);
     ret_val |= es7210_adc_set_gain(ES7210_INPUT_MIC3, GAIN_0DB);
     ret_val |= es7210_adc_set_gain(ES7210_INPUT_MIC4, GAIN_0DB);
+    ret_val |= es7210_adc_config_i2s(cfg.codec_mode, &cfg.i2s_iface);
     ret_val |= es7210_adc_ctrl_state(cfg.codec_mode, AUDIO_HAL_CTRL_START);
 
     if (ESP_OK != ret_val) {
