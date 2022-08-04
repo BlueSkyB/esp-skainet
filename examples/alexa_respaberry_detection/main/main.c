@@ -38,6 +38,14 @@
 
 #define DEBUG_SAVE_PCM      0
 
+// UART & GPIO
+#define ECHO_TEST_TXD  (-1)
+#define ECHO_TEST_RXD  (-1)
+#define ECHO_TEST_RTS  (UART_PIN_NO_CHANGE)
+#define ECHO_TEST_CTS  (UART_PIN_NO_CHANGE)
+#define BUF_SIZE (1024)
+
+// SPI & GPIO
 #define GPIO_HANDSHAKE 18
 #define GPIO_MOSI 8
 #define GPIO_MISO 20
@@ -59,7 +67,45 @@ volatile static int start_flag = 0;
 int detect_flag = 0;
 static esp_afe_sr_iface_t *afe_handle = NULL;
 
+static int64_t start_index, end_index = 0;
+static int detect_channel = 0;
 static ringbuf_handle_t communicate_rb = NULL;
+
+
+// UART start
+static void communicate_uart(void * arg)
+{
+    printf("uart driver start\n");
+
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        // .rx_flow_ctrl_thresh = 124
+    };
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_set_pin(UART_NUM_0, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS);
+    esp_err_t ret = uart_driver_install(UART_NUM_0, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+    printf("uart driver: %d\n", ret);
+
+//     // char *uart_wn_data = calloc(50, 1);
+
+    char *hello_str = "hello!";
+    char *uart_wn_data = calloc(100, 1);
+
+    while (1) {
+        if (start_flag == 1) {
+            sprintf(uart_wn_data, "s=%lld,e=%lld,c=%d;", start_index, end_index, detect_channel);
+            // uart_write_bytes(UART_NUM_0, hello_str, 6);
+            uart_write_bytes(UART_NUM_0, uart_wn_data, strlen(uart_wn_data));
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    vTaskDelete(NULL);
+}
+// UART end
 
 
 // SPI start
@@ -215,7 +261,6 @@ void detect_Task(void *arg)
 
         if (res->wakeup_state == WAKENET_DETECTED) {
             printf("wakeword detected\n");
-            printf("-----------LISTENING-----------\n");
         }
     }
     afe_handle->destroy(afe_data);
@@ -296,5 +341,7 @@ void app_main()
 
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
     xTaskCreatePinnedToCore(&detect_Task, "detect", 4 * 1024, (void*)afe_data, 5, NULL, 1);
+
+    xTaskCreatePinnedToCore(&communicate_uart, "communicate_uart", 2 * 1024, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(&communicate_spi, "communicate_spi", 3 * 1024, NULL, 5, NULL, 0);
 }
