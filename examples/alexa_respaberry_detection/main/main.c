@@ -8,8 +8,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stddef.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
 #include "esp_afe_sr_models.h"
@@ -20,7 +26,28 @@
 #include "model_path.h"
 #include "ringbuf.h"
 
-#define DEBUG_SAVE_PCM      1
+#include "esp_system.h"
+#include "esp_event.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp32s3/rom/gpio.h"
+#include "soc/rtc_periph.h"
+#include "driver/spi_slave.h"
+#include "esp_spi_flash.h"
+
+
+#define DEBUG_SAVE_PCM      0
+
+#define GPIO_HANDSHAKE 18
+#define GPIO_MOSI 8
+#define GPIO_MISO 20
+#define GPIO_SCLK 19
+#define GPIO_CS 6
+#define RCV_HOST SPI2_HOST
+#define DMA_CHAN SPI_DMA_CH_AUTO
+
+#define FRAME_SIZE  640
+
 
 #if DEBUG_SAVE_PCM
 #define FILES_MAX           3
@@ -28,8 +55,97 @@ ringbuf_handle_t rb_debug[FILES_MAX] = {NULL};
 FILE * file_save[FILES_MAX] = {NULL};
 #endif
 
+volatile static int start_flag = 0;
 int detect_flag = 0;
 static esp_afe_sr_iface_t *afe_handle = NULL;
+
+static ringbuf_handle_t communicate_rb = NULL;
+
+
+// SPI start
+//Called after a transaction is queued and ready for pickup by master. We use this to set the handshake line high.
+void my_post_setup_cb(spi_slave_transaction_t *trans) {
+    WRITE_PERI_REG(GPIO_OUT_W1TS_REG, (1 << GPIO_HANDSHAKE));
+}
+
+//Called after transaction is sent/received. We use this to set the handshake line low.
+void my_post_trans_cb(spi_slave_transaction_t *trans) {
+    WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << GPIO_HANDSHAKE));
+}
+
+static void communicate_spi(void * ard)
+{
+    int n = 0;
+    esp_err_t ret;
+
+    //Configuration for the SPI bus
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = GPIO_MOSI,
+        .miso_io_num = GPIO_MISO,
+        .sclk_io_num = GPIO_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096 * 8,
+    };
+
+    //Configuration for the SPI slave interface
+    spi_slave_interface_config_t slvcfg = {
+        .mode = 0,
+        .spics_io_num = GPIO_CS,
+        .queue_size = 3,
+        .flags = 0,
+        .post_setup_cb = my_post_setup_cb,
+        .post_trans_cb = my_post_trans_cb
+    };
+
+    //Configuration for the handshake line
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1 << GPIO_HANDSHAKE)
+    };
+
+    //Configure handshake line as output
+    gpio_config(&io_conf);
+    //Enable pull-ups on SPI lines so we don't detect rogue pulses when no master is connected.
+    gpio_set_pull_mode(GPIO_MOSI, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_SCLK, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_CS, GPIO_PULLUP_ONLY);
+
+    //Initialize SPI slave interface
+    ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, DMA_CHAN);
+    printf("%d\n", ret);
+    assert(ret == ESP_OK);
+
+    WORD_ALIGNED_ATTR char sendbuf_s[6] = "start!";
+    WORD_ALIGNED_ATTR char *sendbuf = heap_caps_malloc(FRAME_SIZE * sizeof(int16_t), MALLOC_CAP_DMA);
+
+    spi_slave_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    size_t i2s_bytes_write = 0;
+
+    while (1) {
+        if (start_flag == 0 || start_flag == -1) {
+            t.tx_buffer = sendbuf_s;
+            t.rx_buffer = NULL;
+            ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
+            printf("\n\n---------@@@-------\n\n");
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+
+            rb_reset(communicate_rb);
+            start_flag = 1;
+        } else {
+            rb_read(communicate_rb, sendbuf, FRAME_SIZE * sizeof(int16_t), portMAX_DELAY);
+
+            t.length = FRAME_SIZE * sizeof(int16_t) * 8;
+            t.tx_buffer = sendbuf;
+            t.rx_buffer = NULL;
+
+            ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
+        }
+    }
+}
+// SPI end
 
 void feed_Task(void *arg)
 {
@@ -91,6 +207,11 @@ void detect_Task(void *arg)
 
         rb_write(rb_debug[1], res->data, afe_chunksize * 1 * sizeof(int16_t), 0);
     #endif
+
+        if (rb_bytes_available(communicate_rb) < afe_chunksize * 1 * sizeof(int16_t)) {
+            // printf("ERROR! communicate_rb slow!!!\n");
+        }
+        rb_write(communicate_rb, res->data, afe_chunksize * 1 * sizeof(int16_t), 0);
 
         if (res->wakeup_state == WAKENET_DETECTED) {
             printf("wakeword detected\n");
@@ -171,6 +292,9 @@ void app_main()
     xTaskCreatePinnedToCore(&debug_pcm_save_Task, "debug_pcm_save", 2 * 1024, NULL, 5, NULL, 1);
 #endif
 
+    communicate_rb = rb_create(1 * 2 * 16000 * 2, 1);   // 2s ringbuf
+
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
     xTaskCreatePinnedToCore(&detect_Task, "detect", 4 * 1024, (void*)afe_data, 5, NULL, 1);
+    xTaskCreatePinnedToCore(&communicate_spi, "communicate_spi", 3 * 1024, NULL, 5, NULL, 0);
 }
