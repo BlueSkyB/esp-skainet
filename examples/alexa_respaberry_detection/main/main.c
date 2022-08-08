@@ -70,6 +70,22 @@ static esp_afe_sr_iface_t *afe_handle = NULL;
 static int64_t start_index, end_index = 0;
 static int detect_channel = 0;
 static ringbuf_handle_t communicate_rb = NULL;
+static SemaphoreHandle_t rdySem;
+
+
+void handshake_scan(void *arg)
+{
+    while (1) {
+        if (start_flag == 1) {
+            if (xSemaphoreTake(rdySem, 1000 / portTICK_PERIOD_MS) == pdFALSE) {
+                start_flag = 0;
+                printf("\n\n---------###-------\n");
+            }
+        } else {
+            vTaskDelay(1);
+        }
+    }
+}
 
 
 // UART start
@@ -117,12 +133,15 @@ void my_post_setup_cb(spi_slave_transaction_t *trans) {
 //Called after transaction is sent/received. We use this to set the handshake line low.
 void my_post_trans_cb(spi_slave_transaction_t *trans) {
     WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << GPIO_HANDSHAKE));
+    BaseType_t mustYield = false;
+    xSemaphoreGiveFromISR(rdySem, &mustYield);
 }
 
-static void communicate_spi(void * ard)
+static void communicate_spi(void * arg)
 {
     int n = 0;
     esp_err_t ret;
+    esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
 
     //Configuration for the SPI bus
     spi_bus_config_t buscfg = {
@@ -171,14 +190,18 @@ static void communicate_spi(void * ard)
     size_t i2s_bytes_write = 0;
 
     while (1) {
-        if (start_flag == 0 || start_flag == -1) {
+        if (start_flag == 0) {
             t.tx_buffer = sendbuf_s;
             t.rx_buffer = NULL;
             ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
             printf("\n\n---------@@@-------\n\n");
-            vTaskDelay(100 / portTICK_PERIOD_MS);
+            // vTaskDelay(100 / portTICK_PERIOD_MS);
 
+            afe_handle->reset_buffer(afe_data);
             rb_reset(communicate_rb);
+            start_index = 0;
+            end_index = 0;
+            detect_channel = 0;
             start_flag = 1;
         } else {
             rb_read(communicate_rb, sendbuf, FRAME_SIZE * sizeof(int16_t), portMAX_DELAY);
@@ -188,6 +211,9 @@ static void communicate_spi(void * ard)
             t.rx_buffer = NULL;
 
             ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
+            if (ret != ESP_OK) {
+                printf("SPI transmit fail.\n");
+            }
         }
     }
 }
@@ -195,7 +221,7 @@ static void communicate_spi(void * ard)
 
 void feed_Task(void *arg)
 {
-    esp_afe_sr_data_t *afe_data = arg;
+    esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
     int audio_chunksize = afe_handle->get_feed_chunksize(afe_data);
     int nch = afe_handle->get_total_channel_num(afe_data);
     int feed_channel = esp_get_feed_channel();
@@ -232,7 +258,7 @@ void feed_Task(void *arg)
 
 void detect_Task(void *arg)
 {
-    esp_afe_sr_data_t *afe_data = arg;
+    esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
     int afe_chunksize = afe_handle->get_fetch_chunksize(afe_data);
     int nch = afe_handle->get_channel_num(afe_data);
     int16_t *buff = malloc(afe_chunksize * sizeof(int16_t));
@@ -258,9 +284,15 @@ void detect_Task(void *arg)
             // printf("ERROR! communicate_rb slow!!!\n");
         }
         rb_write(communicate_rb, res->data, afe_chunksize * 1 * sizeof(int16_t), 0);
+        end_index += afe_chunksize;
 
-        if (res->wakeup_state == WAKENET_DETECTED) {
-            printf("wakeword detected\n");
+        if (res->wakeup_state == WAKENET_CHANNEL_VERIFIED) {
+            start_index = end_index - res->wake_word_length;
+            if (start_index < 0) {
+                start_index = 0;
+            }
+            detect_channel = res->trigger_channel_id;
+            printf("wake_word_length: %d, start_index: %lld, end_index: %lld, detect_channel: %d\n", res->wake_word_length, start_index, end_index, detect_channel);
         }
     }
     afe_handle->destroy(afe_data);
@@ -337,11 +369,13 @@ void app_main()
     xTaskCreatePinnedToCore(&debug_pcm_save_Task, "debug_pcm_save", 2 * 1024, NULL, 5, NULL, 1);
 #endif
 
+    rdySem = xSemaphoreCreateBinary();
     communicate_rb = rb_create(1 * 2 * 16000 * 2, 1);   // 2s ringbuf
 
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
     xTaskCreatePinnedToCore(&detect_Task, "detect", 4 * 1024, (void*)afe_data, 5, NULL, 1);
 
     xTaskCreatePinnedToCore(&communicate_uart, "communicate_uart", 2 * 1024, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(&communicate_spi, "communicate_spi", 3 * 1024, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(&communicate_spi, "communicate_spi", 3 * 1024, (void*)afe_data, 5, NULL, 0);
+    xTaskCreatePinnedToCore(&handshake_scan, "handshake_scan", 1024, NULL, 5, NULL, 1);
 }
