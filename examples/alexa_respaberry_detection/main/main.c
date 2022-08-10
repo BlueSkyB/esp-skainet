@@ -59,8 +59,10 @@
 
 #if DEBUG_SAVE_PCM
 #define FILES_MAX           3
-ringbuf_handle_t rb_debug[FILES_MAX] = {NULL};
-FILE * file_save[FILES_MAX] = {NULL};
+#define READ_SIZE_MAX       32768
+static ringbuf_handle_t rb_debug[FILES_MAX] = {NULL};
+static FILE * file_save[FILES_MAX] = {NULL};
+static int read_size[FILES_MAX] = {0};
 #endif
 
 volatile static int start_flag = 0;
@@ -292,7 +294,7 @@ void detect_Task(void *arg)
                 start_index = 0;
             }
             detect_channel = res->trigger_channel_id;
-            printf("wake_word_length: %d, start_index: %lld, end_index: %lld, detect_channel: %d\n", res->wake_word_length, start_index, end_index, detect_channel);
+            // printf("wake_word_length: %d, start_index: %lld, end_index: %lld, detect_channel: %d\n", res->wake_word_length, start_index, end_index, detect_channel);
         }
     }
     afe_handle->destroy(afe_data);
@@ -306,20 +308,19 @@ void detect_Task(void *arg)
 #if DEBUG_SAVE_PCM
 void debug_pcm_save_Task(void *arg)
 {
-    int size = 4096;   // 4k bytes
-    int16_t *buf_temp = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *buf_temp = heap_caps_calloc(1, READ_SIZE_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     while (1) {
         for (int i = 0; i < FILES_MAX; i++) {
             if (file_save[i] != NULL) {
-                if (rb_bytes_filled(rb_debug[i]) > size) {
-                    int ret = rb_read(rb_debug[i], buf_temp, size, 3000 / portTICK_PERIOD_MS);
-                    if ((ret < 0) || (ret < size)) {
+                if (rb_bytes_filled(rb_debug[i]) > read_size[i]) {
+                    int ret = rb_read(rb_debug[i], buf_temp, read_size[i], 3000 / portTICK_PERIOD_MS);
+                    if ((ret < 0) || (ret < read_size[i])) {
                         // ESP_LOGE(TAG, "rb_debug read error, ret: %d\n", ret);
                         vTaskDelay(10 / portTICK_RATE_MS);
                         continue;
                     }
-                    FatfsComboWrite(buf_temp, size, 1, file_save[i]);
+                    FatfsComboWrite(buf_temp, read_size[i], 1, file_save[i]);
                 }
             }
         }
@@ -358,11 +359,13 @@ void app_main()
     esp_afe_sr_data_t *afe_data = afe_handle->create_from_config(&afe_config);
 
 #if DEBUG_SAVE_PCM
-    rb_debug[0] = rb_create(afe_handle->get_total_channel_num(afe_data) * 4 * 16000 * 2, 1);   // 4s ringbuf
+    read_size[0] = afe_handle->get_total_channel_num(afe_data) * sizeof(int16_t) * 16 * 100;  // 100ms size
+    rb_debug[0] = rb_create(afe_handle->get_total_channel_num(afe_data) * 4 * 16000 * sizeof(int16_t), 1);   // 4s ringbuf
     file_save[0] = fopen("/sdcard/feed.pcm", "w");
     if (file_save[0] == NULL) printf("can not open file\n");
 
-    rb_debug[1] = rb_create(1 * 4 * 16000 * 2, 1);   // 4s ringbuf
+    read_size[1] = 1 * sizeof(int16_t) * 16 * 100;  // 100ms size
+    rb_debug[1] = rb_create(1 * 4 * 16000 * sizeof(int16_t), 1);   // 4s ringbuf
     file_save[1] = fopen("/sdcard/fetch.pcm", "w");
     if (file_save[1] == NULL) printf("can not open file\n");
 
