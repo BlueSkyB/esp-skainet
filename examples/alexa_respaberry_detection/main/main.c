@@ -352,6 +352,7 @@ void app_main()
     afe_config.memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     afe_config.vad_init = false;
     afe_config.wakenet_init = true;
+    afe_config.wakenet_mode = DET_MODE_3CH_90;
     afe_config.wakenet_model_name = wn_name;
     afe_config.voice_communication_init = false;
     afe_config.agc_mode = AFE_MN_PEAK_NO_AGC;
